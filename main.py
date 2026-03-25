@@ -1,18 +1,11 @@
 import os
-import sys
 import asyncio
 import logging
 import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
-
-# Ensure we're using the correct Python version
-if sys.version_info >= (3, 12):
-    print(f"Warning: Python {sys.version} detected. Recommended Python 3.11 for compatibility.")
-    print("If you see errors, please set Python version to 3.11 in runtime.txt")
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request, Form, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,33 +17,15 @@ from passlib.context import CryptContext
 import requests
 import cloudinary
 import cloudinary.uploader
-from sqlalchemy.orm import Session
-from asyncio import Queue
 
-# Import local modules
 from extractor import extract_fields, validate_check_data
-from database import SessionLocal, User, CheckRecord, Base, engine
+from database import get_db, User, CheckRecord, serialize_document, serialize_documents
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Initialize database on startup
-try:
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database initialized successfully")
-except Exception as e:
-    logger.error(f"Database initialization error: {e}")
 
 app = FastAPI(title="Philippine Check Scanner API", version="2.0.0")
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -61,23 +36,17 @@ app.add_middleware(
 
 templates = Jinja2Templates(directory="templates")
 
-# API Keys
 API_KEY = os.getenv("OCR_SPACE_API_KEY", "K87517634688957")
 
-# Cloudinary configuration
 cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
 api_key = os.getenv("CLOUDINARY_API_KEY")
 api_secret = os.getenv("CLOUDINARY_API_SECRET")
 if cloud_name and api_key and api_secret:
-    try:
-        cloudinary.config(cloud_name=cloud_name, api_key=api_key, api_secret=api_secret)
-        logger.info("Cloudinary configured successfully")
-    except Exception as e:
-        logger.error(f"Cloudinary config error: {e}")
+    cloudinary.config(cloud_name=cloud_name, api_key=api_key, api_secret=api_secret)
+    logger.info("Cloudinary configured successfully")
 else:
-    logger.warning("Cloudinary credentials missing - images will be saved locally")
+    logger.warning("Cloudinary credentials missing")
 
-# Security
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
@@ -86,32 +55,25 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # ========== Database ==========
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 def verify_password(plain, hashed):
     return pwd_context.verify(plain, hashed)
 
 def get_password_hash(password):
     return pwd_context.hash(password)
 
-def authenticate_user(db: Session, username: str, password: str):
-    user = db.query(User).filter(User.username == username).first()
-    if not user or not verify_password(password, user.password_hash):
+async def authenticate_user(db, username: str, password: str):
+    user = User.find_by_username(db, username)
+    if not user or not verify_password(password, user["password_hash"]):
         return None
     return user
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+async def get_current_user(token: str = Depends(oauth2_scheme), db = Depends(get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -124,7 +86,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
             raise credentials_exception
     except JWTError:
         raise credentials_exception
-    user = db.query(User).filter(User.username == username).first()
+    user = User.find_by_username(db, username)
     if user is None:
         raise credentials_exception
     return user
@@ -134,11 +96,11 @@ notification_queues = []
 MAX_NOTIFICATIONS = 500
 notifications = []
 
-def add_notification(user_name: str, check_id: int, action: str = "new_check"):
+def add_notification(user_name: str, check_id: str, action: str = "new_check"):
     timestamp = datetime.now()
     notification = {
         "id": len(notifications) + 1,
-        "message": f"New check received by {user_name} (Check #{check_id})",
+        "message": f"New check received from {user_name} (Check #{check_id})",
         "user_name": user_name,
         "check_id": check_id,
         "action": action,
@@ -158,7 +120,7 @@ def add_notification(user_name: str, check_id: int, action: str = "new_check"):
 @app.get("/api/notifications/stream")
 async def notifications_stream():
     async def event_generator():
-        queue = Queue()
+        queue = asyncio.Queue()
         notification_queues.append(queue)
         try:
             while True:
@@ -205,9 +167,9 @@ async def mark_notifications_read():
 
 # ========== Public endpoints ==========
 @app.get("/api/checks")
-async def get_checks(db: Session = Depends(get_db)):
-    checks = db.query(CheckRecord).order_by(CheckRecord.created_at.desc()).all()
-    return checks
+async def get_checks(db = Depends(get_db)):
+    checks = CheckRecord.get_all(db)
+    return serialize_documents(checks)
 
 # ========== Auth endpoints ==========
 @app.post("/register")
@@ -215,29 +177,26 @@ async def register(
     username: str = Form(...),
     full_name: str = Form(...),
     password: str = Form(...),
-    db: Session = Depends(get_db)
+    db = Depends(get_db)
 ):
-    existing = db.query(User).filter(User.username == username).first()
+    existing = User.find_by_username(db, username)
     if existing:
         raise HTTPException(status_code=400, detail="Username already registered")
     hashed = get_password_hash(password)
-    user = User(username=username, full_name=full_name, password_hash=hashed)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return {"message": "User created successfully", "user_id": user.id}
+    user = User.create(db, username, full_name, hashed)
+    return {"message": "User created successfully", "user_id": str(user["_id"])}
 
 @app.post("/login")
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = authenticate_user(db, form_data.username, form_data.password)
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db = Depends(get_db)):
+    user = await authenticate_user(db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    token = create_access_token(data={"sub": user.username}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    return {"access_token": token, "token_type": "bearer", "full_name": user.full_name}
+    token = create_access_token(data={"sub": user["username"]}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    return {"access_token": token, "token_type": "bearer", "full_name": user["full_name"]}
 
 # ========== Scan endpoints ==========
 @app.post("/scan-check")
@@ -336,8 +295,8 @@ async def scan_check_debug(file: UploadFile = File(...)):
 async def save_check(
     check_data: str = Form(...),
     image: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    current_user = Depends(get_current_user),
+    db = Depends(get_db)
 ):
     try:
         data = json.loads(check_data)
@@ -347,141 +306,136 @@ async def save_check(
     if not data.get("check_no"):
         raise HTTPException(status_code=400, detail="Check number is required")
 
-    # Handle image upload
-    image_url = None
+    # Check for duplicate check number
+    existing = CheckRecord.find_by_check_no(db, data["check_no"])
+    if existing:
+        raise HTTPException(status_code=400, detail="Check number already exists")
+
     try:
         image_bytes = await image.read()
-        
-        if cloud_name and api_key and api_secret:
-            try:
-                upload_result = cloudinary.uploader.upload(
-                    image_bytes,
-                    folder="check_scans",
-                    public_id=f"check_{data.get('check_no', 'unknown')}"
-                )
-                image_url = upload_result.get("secure_url")
-                logger.info(f"Image uploaded to Cloudinary: {image_url}")
-            except Exception as e:
-                logger.error(f"Cloudinary upload error: {e}")
-                # Fallback to local storage
-                os.makedirs("uploads", exist_ok=True)
-                local_path = f"uploads/check_{data.get('check_no', 'unknown')}.jpg"
-                with open(local_path, "wb") as f:
-                    f.write(image_bytes)
-                image_url = local_path
-        else:
-            # Local storage
-            os.makedirs("uploads", exist_ok=True)
-            local_path = f"uploads/check_{data.get('check_no', 'unknown')}.jpg"
-            with open(local_path, "wb") as f:
-                f.write(image_bytes)
-            image_url = local_path
+        upload_result = cloudinary.uploader.upload(
+            image_bytes,
+            folder="check_scans",
+            public_id=f"check_{data.get('check_no', 'unknown')}"
+        )
+        image_url = upload_result.get("secure_url")
     except Exception as e:
-        logger.error(f"Image save error: {e}")
+        logger.error(f"Cloudinary upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload image")
 
-    db_check = CheckRecord(
-        user_id=current_user.id,
-        user_full_name=current_user.full_name,
-        account_no=data.get("account_no"),
-        account_name=data.get("account_name"),
-        pay_to_the_order_of=data.get("pay_to_the_order_of"),
-        check_no=data.get("check_no"),
-        amount=data.get("amount"),
-        bank_name=data.get("bank_name"),
-        date=data.get("date"),
-        image_url=image_url,
-        cr=data.get("cr"),
-        cr_date=data.get("cr_date"),
-        received_by=data.get("received_by"),
-        deposited_by=data.get("deposited_by")
-    )
-    db.add(db_check)
-    db.commit()
-    db.refresh(db_check)
+    check_record = {
+        "user_id": str(current_user["_id"]),
+        "user_full_name": current_user["full_name"],
+        "account_no": data.get("account_no"),
+        "account_name": data.get("account_name"),
+        "pay_to_the_order_of": data.get("pay_to_the_order_of"),
+        "check_no": data.get("check_no"),
+        "amount": data.get("amount"),
+        "bank_name": data.get("bank_name"),
+        "date": data.get("date"),
+        "image_url": image_url,
+        "is_received": data.get("is_received", False),
+        "received_date": data.get("received_date"),
+        "received_by": data.get("received_by"),
+        "cr": data.get("cr"),
+        "cr_date": data.get("cr_date"),
+        "date_deposited": data.get("date_deposited"),
+        "bank_deposited": data.get("bank_deposited"),
+        "deposited_by": data.get("deposited_by")
+    }
+    
+    saved_check = CheckRecord.create(db, check_record)
+    check_id = str(saved_check["_id"])
 
-    add_notification(current_user.full_name, db_check.id)
+    add_notification(current_user["full_name"], check_id)
 
     return {
         "success": True,
         "message": "Check saved successfully",
-        "id": db_check.id,
+        "id": check_id,
         "image_url": image_url
     }
 
 # ========== Management endpoints ==========
 @app.put("/api/checks/{check_id}")
-async def update_check(check_id: int, update_data: dict, db: Session = Depends(get_db)):
-    check = db.query(CheckRecord).filter(CheckRecord.id == check_id).first()
+async def update_check(check_id: str, update_data: dict, db = Depends(get_db)):
+    check = CheckRecord.find_by_id(db, check_id)
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
     allowed_fields = ["account_name", "pay_to_the_order_of", "amount", "date", "cr", "cr_date", 
                       "date_deposited", "bank_deposited", "received_by", "deposited_by"]
+    filtered_update = {}
     for field in allowed_fields:
         if field in update_data:
-            setattr(check, field, update_data[field])
-    db.commit()
-    return {"success": True, "message": "Check updated"}
+            filtered_update[field] = update_data[field]
+    if CheckRecord.update(db, check_id, filtered_update):
+        return {"success": True, "message": "Check updated"}
+    raise HTTPException(status_code=500, detail="Update failed")
 
 @app.delete("/api/checks/{check_id}")
-async def delete_check(check_id: int, db: Session = Depends(get_db)):
-    check = db.query(CheckRecord).filter(CheckRecord.id == check_id).first()
+async def delete_check(check_id: str, db = Depends(get_db)):
+    check = CheckRecord.find_by_id(db, check_id)
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
-    db.delete(check)
-    db.commit()
-    return {"success": True, "message": "Check deleted"}
+    if CheckRecord.delete(db, check_id):
+        return {"success": True, "message": "Check deleted"}
+    raise HTTPException(status_code=500, detail="Delete failed")
 
 @app.put("/api/checks/{check_id}/received")
 async def mark_received(
-    check_id: int,
+    check_id: str,
     received_date: str = Form(...),
     received_by: str = Form(...),
-    db: Session = Depends(get_db)
+    db = Depends(get_db)
 ):
-    check = db.query(CheckRecord).filter(CheckRecord.id == check_id).first()
+    check = CheckRecord.find_by_id(db, check_id)
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
-    check.is_received = True
-    check.received_date = received_date
-    check.received_by = received_by
-    db.commit()
-    return {"success": True, "message": "Check marked as received"}
+    if CheckRecord.update(db, check_id, {
+        "is_received": True,
+        "received_date": received_date,
+        "received_by": received_by
+    }):
+        return {"success": True, "message": "Check marked as received"}
+    raise HTTPException(status_code=500, detail="Update failed")
 
 @app.put("/api/checks/{check_id}/unreceived")
-async def mark_unreceived(check_id: int, db: Session = Depends(get_db)):
-    check = db.query(CheckRecord).filter(CheckRecord.id == check_id).first()
+async def mark_unreceived(check_id: str, db = Depends(get_db)):
+    check = CheckRecord.find_by_id(db, check_id)
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
-    check.is_received = False
-    check.received_date = None
-    check.received_by = None
-    db.commit()
-    return {"success": True, "message": "Check unmarked"}
+    if CheckRecord.update(db, check_id, {
+        "is_received": False,
+        "received_date": None,
+        "received_by": None
+    }):
+        return {"success": True, "message": "Check unmarked"}
+    raise HTTPException(status_code=500, detail="Update failed")
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request, db: Session = Depends(get_db)):
-    checks = db.query(CheckRecord).order_by(CheckRecord.created_at.desc()).all()
-    return templates.TemplateResponse("dashboard.html", {"request": request, "checks": checks})
+async def dashboard(request: Request, db = Depends(get_db)):
+    checks = CheckRecord.get_all(db)
+    return templates.TemplateResponse("dashboard.html", {"request": request, "checks": serialize_documents(checks)})
 
 @app.get("/")
 async def root():
     return {
         "message": "Philippine Check Scanner API",
         "version": "2.0.0",
+        "database": "MongoDB Atlas",
+        "database_name": "Deltaplus_checkscanner",
         "status": "running",
-        "python_version": sys.version,
         "extracted_fields": ["account_no", "account_name", "pay_to_the_order_of", "check_no", "amount", "bank_name", "date"]
     }
 
 @app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "python_version": sys.version
-    }
+async def health_check(db = Depends(get_db)):
+    try:
+        db.command('ping')
+        return {"status": "healthy", "timestamp": datetime.now().isoformat(), "database": "connected"}
+    except:
+        return {"status": "unhealthy", "timestamp": datetime.now().isoformat(), "database": "disconnected"}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

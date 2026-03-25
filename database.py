@@ -1,86 +1,155 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, inspect
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.sql import text
 from datetime import datetime
+from typing import Optional, Dict, Any, List
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
+from bson import ObjectId
 import os
+import logging
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./checks.db")
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# MongoDB Atlas connection
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://YOUR_USERNAME:YOUR_PASSWORD@YOUR_CLUSTER.mongodb.net/?retryWrites=true&w=majority")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "Deltaplus_checkscanner")
 
-class User(Base):
-    __tablename__ = "users"
+class MongoDB:
+    def __init__(self):
+        self.client = None
+        self.db = None
+        self.connect()
+    
+    def connect(self):
+        try:
+            self.client = MongoClient(MONGO_URI)
+            self.db = self.client[MONGO_DB_NAME]
+            # Test connection
+            self.client.admin.command('ping')
+            logger.info(f"Connected to MongoDB Atlas database: {MONGO_DB_NAME}")
+            self._create_indexes()
+        except Exception as e:
+            logger.error(f"MongoDB connection error: {e}")
+            raise
+    
+    def _create_indexes(self):
+        try:
+            self.db.users.create_index("username", unique=True)
+            self.db.checks.create_index("user_id")
+            self.db.checks.create_index("check_no")
+            self.db.checks.create_index("created_at", DESCENDING)
+            logger.info("Database indexes created successfully")
+        except Exception as e:
+            logger.warning(f"Error creating indexes: {e}")
+    
+    def close(self):
+        if self.client:
+            self.client.close()
+            logger.info("MongoDB connection closed")
 
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, nullable=False, index=True)
-    full_name = Column(String, nullable=False)
-    password_hash = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+# Global database instance
+db_instance = MongoDB()
 
-    checks = relationship("CheckRecord", back_populates="user")
+def get_db():
+    try:
+        return db_instance.db
+    except Exception as e:
+        logger.error(f"Error getting database connection: {e}")
+        raise
 
-class CheckRecord(Base):
-    __tablename__ = "checks"
+def serialize_document(doc: Dict[str, Any]) -> Dict[str, Any]:
+    if doc and "_id" in doc:
+        doc["_id"] = str(doc["_id"])
+    return doc
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    user_full_name = Column(String, nullable=True)
-    account_no = Column(String, nullable=True)
-    account_name = Column(String, nullable=True)
-    pay_to_the_order_of = Column(String, nullable=True)
-    check_no = Column(String, nullable=True)
-    amount = Column(String, nullable=True)
-    bank_name = Column(String, nullable=True)
-    date = Column(String, nullable=True)
-    image_url = Column(String, nullable=True)
-    is_received = Column(Boolean, default=False)
-    received_date = Column(String, nullable=True)
-    received_by = Column(String, nullable=True)  # New column: Person who received the check
-    cr = Column(String, nullable=True)
-    cr_date = Column(String, nullable=True)
-    date_deposited = Column(String, nullable=True)      # Date when deposited
-    bank_deposited = Column(String, nullable=True)      # Bank where deposited
-    deposited_by = Column(String, nullable=True)        # New column: Person who deposited the check
-    created_at = Column(DateTime, default=datetime.utcnow)
+def serialize_documents(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [serialize_document(doc) for doc in docs]
 
-    user = relationship("User", back_populates="checks")
+class User:
+    @staticmethod
+    def create(db, username: str, full_name: str, password_hash: str) -> Dict[str, Any]:
+        user = {
+            "username": username,
+            "full_name": full_name,
+            "password_hash": password_hash,
+            "created_at": datetime.utcnow()
+        }
+        try:
+            result = db.users.insert_one(user)
+            user["_id"] = result.inserted_id
+            return user
+        except DuplicateKeyError:
+            raise ValueError("Username already exists")
+    
+    @staticmethod
+    def find_by_username(db, username: str) -> Optional[Dict[str, Any]]:
+        return db.users.find_one({"username": username})
+    
+    @staticmethod
+    def find_by_id(db, user_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            return db.users.find_one({"_id": ObjectId(user_id)})
+        except:
+            return None
 
-# Create tables if they don't exist
-Base.metadata.create_all(bind=engine)
-
-# Migrations for existing tables
-inspector = inspect(engine)
-if 'checks' in inspector.get_table_names():
-    columns = [col['name'] for col in inspector.get_columns('checks')]
-    with engine.connect() as conn:
-        # Rename delivery_date to date_deposited if it exists
-        if 'delivery_date' in columns:
-            conn.execute(text("ALTER TABLE checks RENAME COLUMN delivery_date TO date_deposited"))
-            conn.commit()
-            print("Renamed delivery_date to date_deposited")
-            # Refresh columns list
-            columns = [col['name'] for col in inspector.get_columns('checks')]
-        # Add date_deposited if still missing
-        if 'date_deposited' not in columns:
-            conn.execute(text("ALTER TABLE checks ADD COLUMN date_deposited TEXT"))
-            conn.commit()
-            print("Added date_deposited column")
-        # Add bank_deposited if missing
-        if 'bank_deposited' not in columns:
-            conn.execute(text("ALTER TABLE checks ADD COLUMN bank_deposited TEXT"))
-            conn.commit()
-            print("Added bank_deposited column")
-        # Add received_by column if missing
-        if 'received_by' not in columns:
-            conn.execute(text("ALTER TABLE checks ADD COLUMN received_by TEXT"))
-            conn.commit()
-            print("Added received_by column")
-        # Add deposited_by column if missing
-        if 'deposited_by' not in columns:
-            conn.execute(text("ALTER TABLE checks ADD COLUMN deposited_by TEXT"))
-            conn.commit()
-            print("Added deposited_by column")
+class CheckRecord:
+    @staticmethod
+    def create(db, check_data: Dict[str, Any]) -> Dict[str, Any]:
+        check = {
+            "user_id": check_data.get("user_id"),
+            "user_full_name": check_data.get("user_full_name"),
+            "account_no": check_data.get("account_no"),
+            "account_name": check_data.get("account_name"),
+            "pay_to_the_order_of": check_data.get("pay_to_the_order_of"),
+            "check_no": check_data.get("check_no"),
+            "amount": check_data.get("amount"),
+            "bank_name": check_data.get("bank_name"),
+            "date": check_data.get("date"),
+            "image_url": check_data.get("image_url"),
+            "is_received": check_data.get("is_received", False),
+            "received_date": check_data.get("received_date"),
+            "received_by": check_data.get("received_by"),
+            "cr": check_data.get("cr"),
+            "cr_date": check_data.get("cr_date"),
+            "date_deposited": check_data.get("date_deposited"),
+            "bank_deposited": check_data.get("bank_deposited"),
+            "deposited_by": check_data.get("deposited_by"),
+            "created_at": datetime.utcnow()
+        }
+        
+        result = db.checks.insert_one(check)
+        check["_id"] = result.inserted_id
+        return check
+    
+    @staticmethod
+    def find_by_id(db, check_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            return db.checks.find_one({"_id": ObjectId(check_id)})
+        except:
+            return None
+    
+    @staticmethod
+    def find_by_check_no(db, check_no: str) -> Optional[Dict[str, Any]]:
+        return db.checks.find_one({"check_no": check_no})
+    
+    @staticmethod
+    def get_all(db) -> List[Dict[str, Any]]:
+        return list(db.checks.find().sort("created_at", DESCENDING))
+    
+    @staticmethod
+    def update(db, check_id: str, update_data: Dict[str, Any]) -> bool:
+        try:
+            result = db.checks.update_one(
+                {"_id": ObjectId(check_id)},
+                {"$set": update_data}
+            )
+            return result.modified_count > 0
+        except:
+            return False
+    
+    @staticmethod
+    def delete(db, check_id: str) -> bool:
+        try:
+            result = db.checks.delete_one({"_id": ObjectId(check_id)})
+            return result.deleted_count > 0
+        except:
+            return False
