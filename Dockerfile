@@ -10,16 +10,18 @@ ENV PYTHONPATH=/app
 WORKDIR /app
 
 # Install system dependencies required for OpenCV and other packages
+# Updated package names for Debian Trixie
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
     wget \
+    libglib2.0-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (for better caching)
