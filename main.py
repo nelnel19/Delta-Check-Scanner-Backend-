@@ -1,11 +1,18 @@
 import os
+import sys
 import asyncio
 import logging
 import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
+
+# Ensure we're using the correct Python version
+if sys.version_info >= (3, 12):
+    print(f"Warning: Python {sys.version} detected. Recommended Python 3.11 for compatibility.")
+    print("If you see errors, please set Python version to 3.11 in runtime.txt")
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request, Form, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,14 +27,30 @@ import cloudinary.uploader
 from sqlalchemy.orm import Session
 from asyncio import Queue
 
+# Import local modules
 from extractor import extract_fields, validate_check_data
-from database import SessionLocal, User, CheckRecord
+from database import SessionLocal, User, CheckRecord, Base, engine
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 logger = logging.getLogger(__name__)
+
+# Initialize database on startup
+try:
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database initialized successfully")
+except Exception as e:
+    logger.error(f"Database initialization error: {e}")
 
 app = FastAPI(title="Philippine Check Scanner API", version="2.0.0")
 
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,17 +61,23 @@ app.add_middleware(
 
 templates = Jinja2Templates(directory="templates")
 
+# API Keys
 API_KEY = os.getenv("OCR_SPACE_API_KEY", "K87517634688957")
 
+# Cloudinary configuration
 cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
 api_key = os.getenv("CLOUDINARY_API_KEY")
 api_secret = os.getenv("CLOUDINARY_API_SECRET")
 if cloud_name and api_key and api_secret:
-    cloudinary.config(cloud_name=cloud_name, api_key=api_key, api_secret=api_secret)
-    logger.info("Cloudinary configured successfully")
+    try:
+        cloudinary.config(cloud_name=cloud_name, api_key=api_key, api_secret=api_secret)
+        logger.info("Cloudinary configured successfully")
+    except Exception as e:
+        logger.error(f"Cloudinary config error: {e}")
 else:
-    logger.warning("Cloudinary credentials missing")
+    logger.warning("Cloudinary credentials missing - images will be saved locally")
 
+# Security
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
@@ -78,7 +107,7 @@ def authenticate_user(db: Session, username: str, password: str):
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -318,17 +347,37 @@ async def save_check(
     if not data.get("check_no"):
         raise HTTPException(status_code=400, detail="Check number is required")
 
+    # Handle image upload
+    image_url = None
     try:
         image_bytes = await image.read()
-        upload_result = cloudinary.uploader.upload(
-            image_bytes,
-            folder="check_scans",
-            public_id=f"check_{data.get('check_no', 'unknown')}"
-        )
-        image_url = upload_result.get("secure_url")
+        
+        if cloud_name and api_key and api_secret:
+            try:
+                upload_result = cloudinary.uploader.upload(
+                    image_bytes,
+                    folder="check_scans",
+                    public_id=f"check_{data.get('check_no', 'unknown')}"
+                )
+                image_url = upload_result.get("secure_url")
+                logger.info(f"Image uploaded to Cloudinary: {image_url}")
+            except Exception as e:
+                logger.error(f"Cloudinary upload error: {e}")
+                # Fallback to local storage
+                os.makedirs("uploads", exist_ok=True)
+                local_path = f"uploads/check_{data.get('check_no', 'unknown')}.jpg"
+                with open(local_path, "wb") as f:
+                    f.write(image_bytes)
+                image_url = local_path
+        else:
+            # Local storage
+            os.makedirs("uploads", exist_ok=True)
+            local_path = f"uploads/check_{data.get('check_no', 'unknown')}.jpg"
+            with open(local_path, "wb") as f:
+                f.write(image_bytes)
+            image_url = local_path
     except Exception as e:
-        logger.error(f"Cloudinary upload error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to upload image")
+        logger.error(f"Image save error: {e}")
 
     db_check = CheckRecord(
         user_id=current_user.id,
@@ -420,13 +469,19 @@ async def root():
         "message": "Philippine Check Scanner API",
         "version": "2.0.0",
         "status": "running",
+        "python_version": sys.version,
         "extracted_fields": ["account_no", "account_name", "pay_to_the_order_of", "check_no", "amount", "bank_name", "date"]
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "python_version": sys.version
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
