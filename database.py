@@ -39,10 +39,12 @@ class CheckRecord(Base):
     image_url = Column(String, nullable=True)
     is_received = Column(Boolean, default=False)
     received_date = Column(String, nullable=True)
+    received_by = Column(String, nullable=True)  # New column: Person who received the check
     cr = Column(String, nullable=True)
     cr_date = Column(String, nullable=True)
     date_deposited = Column(String, nullable=True)      # Date when deposited
     bank_deposited = Column(String, nullable=True)      # Bank where deposited
+    deposited_by = Column(String, nullable=True)        # New column: Person who deposited the check
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="checks")
@@ -72,3 +74,13 @@ if 'checks' in inspector.get_table_names():
             conn.execute(text("ALTER TABLE checks ADD COLUMN bank_deposited TEXT"))
             conn.commit()
             print("Added bank_deposited column")
+        # Add received_by column if missing
+        if 'received_by' not in columns:
+            conn.execute(text("ALTER TABLE checks ADD COLUMN received_by TEXT"))
+            conn.commit()
+            print("Added received_by column")
+        # Add deposited_by column if missing
+        if 'deposited_by' not in columns:
+            conn.execute(text("ALTER TABLE checks ADD COLUMN deposited_by TEXT"))
+            conn.commit()
+            print("Added deposited_by column")

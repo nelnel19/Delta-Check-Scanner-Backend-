@@ -101,12 +101,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     return user
 
 # ========== Notifications ==========
-# main.py (updated notification section)
-
-# ========== Notifications ==========
 notification_queues = []
-MAX_NOTIFICATIONS = 500  # Increased to store more history
-notifications = []  # This will store persistent notifications
+MAX_NOTIFICATIONS = 500
+notifications = []
 
 def add_notification(user_name: str, check_id: int, action: str = "new_check"):
     timestamp = datetime.now()
@@ -119,18 +116,31 @@ def add_notification(user_name: str, check_id: int, action: str = "new_check"):
         "timestamp": timestamp.isoformat(),
         "read": False
     }
-    notifications.insert(0, notification)  # Add to beginning (newest first)
+    notifications.insert(0, notification)
     while len(notifications) > MAX_NOTIFICATIONS:
-        notifications.pop()  # Remove oldest when exceeding limit
+        notifications.pop()
     
-    # Send to all connected SSE clients
     for q in notification_queues:
         try:
             q.put_nowait(notification)
         except asyncio.QueueFull:
             pass
 
-# Add endpoint to mark individual notification as read
+@app.get("/api/notifications/stream")
+async def notifications_stream():
+    async def event_generator():
+        queue = Queue()
+        notification_queues.append(queue)
+        try:
+            while True:
+                notification = await queue.get()
+                yield f"data: {json.dumps(notification)}\n\n"
+        except asyncio.CancelledError:
+            notification_queues.remove(queue)
+            raise
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 @app.put("/api/notifications/{notification_id}/read")
 async def mark_notification_read(notification_id: int):
     for n in notifications:
@@ -139,19 +149,16 @@ async def mark_notification_read(notification_id: int):
             return {"success": True}
     raise HTTPException(status_code=404, detail="Notification not found")
 
-# Add endpoint to clear all notifications
 @app.delete("/api/notifications/clear")
 async def clear_notifications():
     global notifications
     notifications = []
     return {"success": True, "message": "All notifications cleared"}
 
-# Add endpoint to get notification history
 @app.get("/api/notifications/history")
 async def get_notification_history(limit: int = 100):
     return notifications[:limit]
 
-# Keep the existing notification endpoints
 @app.get("/api/notifications")
 async def get_notifications():
     return notifications
@@ -335,7 +342,9 @@ async def save_check(
         date=data.get("date"),
         image_url=image_url,
         cr=data.get("cr"),
-        cr_date=data.get("cr_date")
+        cr_date=data.get("cr_date"),
+        received_by=data.get("received_by"),
+        deposited_by=data.get("deposited_by")
     )
     db.add(db_check)
     db.commit()
@@ -356,7 +365,8 @@ async def update_check(check_id: int, update_data: dict, db: Session = Depends(g
     check = db.query(CheckRecord).filter(CheckRecord.id == check_id).first()
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
-    allowed_fields = ["account_name", "pay_to_the_order_of", "amount", "date", "cr", "cr_date", "date_deposited", "bank_deposited"]
+    allowed_fields = ["account_name", "pay_to_the_order_of", "amount", "date", "cr", "cr_date", 
+                      "date_deposited", "bank_deposited", "received_by", "deposited_by"]
     for field in allowed_fields:
         if field in update_data:
             setattr(check, field, update_data[field])
@@ -376,6 +386,7 @@ async def delete_check(check_id: int, db: Session = Depends(get_db)):
 async def mark_received(
     check_id: int,
     received_date: str = Form(...),
+    received_by: str = Form(...),
     db: Session = Depends(get_db)
 ):
     check = db.query(CheckRecord).filter(CheckRecord.id == check_id).first()
@@ -383,6 +394,7 @@ async def mark_received(
         raise HTTPException(status_code=404, detail="Check not found")
     check.is_received = True
     check.received_date = received_date
+    check.received_by = received_by
     db.commit()
     return {"success": True, "message": "Check marked as received"}
 
@@ -393,6 +405,7 @@ async def mark_unreceived(check_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Check not found")
     check.is_received = False
     check.received_date = None
+    check.received_by = None
     db.commit()
     return {"success": True, "message": "Check unmarked"}
 
