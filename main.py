@@ -11,7 +11,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import requests
@@ -186,9 +186,14 @@ async def register(
     user = User.create(db, username, full_name, hashed)
     return {"message": "User created successfully", "user_id": str(user["_id"])}
 
+# Fixed login endpoint without OAuth2PasswordRequestForm
 @app.post("/login")
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db = Depends(get_db)):
-    user = await authenticate_user(db, form_data.username, form_data.password)
+async def login(
+    username: str = Form(...),
+    password: str = Form(...),
+    db = Depends(get_db)
+):
+    user = await authenticate_user(db, username, password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

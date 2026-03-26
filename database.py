@@ -33,10 +33,11 @@ class MongoDB:
     
     def _create_indexes(self):
         try:
-            self.db.users.create_index("username", unique=True)
-            self.db.checks.create_index("user_id")
-            self.db.checks.create_index("check_no")
-            self.db.checks.create_index("created_at", DESCENDING)
+            # Create indexes with proper syntax
+            self.db.users.create_index([("username", ASCENDING)], unique=True)
+            self.db.checks.create_index([("user_id", ASCENDING)])
+            self.db.checks.create_index([("check_no", ASCENDING)], unique=True, sparse=True)
+            self.db.checks.create_index([("created_at", DESCENDING)])
             logger.info("Database indexes created successfully")
         except Exception as e:
             logger.warning(f"Error creating indexes: {e}")
