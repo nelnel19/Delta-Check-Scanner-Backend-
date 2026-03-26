@@ -17,15 +17,20 @@ from passlib.context import CryptContext
 import requests
 import cloudinary
 import cloudinary.uploader
+import bcrypt  # Explicit bcrypt import to ensure it's loaded
 
 from extractor import extract_fields, validate_check_data
 from database import get_db, User, CheckRecord, serialize_document, serialize_documents
+
+# Force bcrypt to initialize properly
+bcrypt.__about__ = type('about', (), {'__version__': bcrypt.__version__})
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Philippine Check Scanner API", version="2.0.0")
 
+# Updated CORS middleware - allow all origins for now (adjust for production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,6 +43,7 @@ templates = Jinja2Templates(directory="templates")
 
 API_KEY = os.getenv("OCR_SPACE_API_KEY", "K87517634688957")
 
+# Cloudinary configuration
 cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
 api_key = os.getenv("CLOUDINARY_API_KEY")
 api_secret = os.getenv("CLOUDINARY_API_SECRET")
@@ -51,29 +57,50 @@ SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Updated CryptContext with explicit bcrypt configuration
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto",
+    bcrypt__rounds=12,
+    bcrypt__ident="2b"
+)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # ========== Database ==========
-def verify_password(plain, hashed):
-    return pwd_context.verify(plain, hashed)
+def verify_password(plain: str, hashed: str) -> bool:
+    """Verify a plain password against a hashed password"""
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception as e:
+        logger.error(f"Password verification error: {e}")
+        return False
 
-def get_password_hash(password):
-    return pwd_context.hash(password)
+def get_password_hash(password: str) -> str:
+    """Hash a password using bcrypt"""
+    try:
+        return pwd_context.hash(password)
+    except Exception as e:
+        logger.error(f"Password hashing error: {e}")
+        raise HTTPException(status_code=500, detail="Error hashing password")
 
 async def authenticate_user(db, username: str, password: str):
+    """Authenticate a user by username and password"""
     user = User.find_by_username(db, username)
-    if not user or not verify_password(password, user["password_hash"]):
+    if not user:
+        return None
+    if not verify_password(password, user["password_hash"]):
         return None
     return user
 
-def create_access_token(data: dict, expires_delta: timedelta = None):
+def create_access_token(data: dict, expires_delta: timedelta = None) -> str:
+    """Create a JWT access token"""
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db = Depends(get_db)):
+    """Get the current authenticated user from the token"""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -97,6 +124,7 @@ MAX_NOTIFICATIONS = 500
 notifications = []
 
 def add_notification(user_name: str, check_id: str, action: str = "new_check"):
+    """Add a new notification"""
     timestamp = datetime.now()
     notification = {
         "id": len(notifications) + 1,
@@ -119,6 +147,7 @@ def add_notification(user_name: str, check_id: str, action: str = "new_check"):
 
 @app.get("/api/notifications/stream")
 async def notifications_stream():
+    """Server-Sent Events endpoint for real-time notifications"""
     async def event_generator():
         queue = asyncio.Queue()
         notification_queues.append(queue)
@@ -134,6 +163,7 @@ async def notifications_stream():
 
 @app.put("/api/notifications/{notification_id}/read")
 async def mark_notification_read(notification_id: int):
+    """Mark a notification as read"""
     for n in notifications:
         if n["id"] == notification_id:
             n["read"] = True
@@ -142,25 +172,30 @@ async def mark_notification_read(notification_id: int):
 
 @app.delete("/api/notifications/clear")
 async def clear_notifications():
+    """Clear all notifications"""
     global notifications
     notifications = []
     return {"success": True, "message": "All notifications cleared"}
 
 @app.get("/api/notifications/history")
 async def get_notification_history(limit: int = 100):
+    """Get notification history"""
     return notifications[:limit]
 
 @app.get("/api/notifications")
 async def get_notifications():
+    """Get all notifications"""
     return notifications
 
 @app.get("/api/notifications/unread-count")
 async def get_unread_count():
+    """Get count of unread notifications"""
     unread = sum(1 for n in notifications if not n["read"])
     return {"unread": unread}
 
 @app.put("/api/notifications/mark-read")
 async def mark_notifications_read():
+    """Mark all notifications as read"""
     for n in notifications:
         n["read"] = True
     return {"success": True}
@@ -168,6 +203,7 @@ async def mark_notifications_read():
 # ========== Public endpoints ==========
 @app.get("/api/checks")
 async def get_checks(db = Depends(get_db)):
+    """Get all checks"""
     checks = CheckRecord.get_all(db)
     return serialize_documents(checks)
 
@@ -179,6 +215,7 @@ async def register(
     password: str = Form(...),
     db = Depends(get_db)
 ):
+    """Register a new user"""
     existing = User.find_by_username(db, username)
     if existing:
         raise HTTPException(status_code=400, detail="Username already registered")
@@ -193,6 +230,7 @@ async def login(
     password: str = Form(...),
     db = Depends(get_db)
 ):
+    """Login and get access token"""
     user = await authenticate_user(db, username, password)
     if not user:
         raise HTTPException(
@@ -200,12 +238,16 @@ async def login(
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    token = create_access_token(data={"sub": user["username"]}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    token = create_access_token(
+        data={"sub": user["username"]}, 
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
     return {"access_token": token, "token_type": "bearer", "full_name": user["full_name"]}
 
 # ========== Scan endpoints ==========
 @app.post("/scan-check")
 async def scan_check(file: UploadFile = File(...)):
+    """Scan a check image and extract data using OCR"""
     try:
         if not file.content_type or not file.content_type.startswith('image/'):
             raise HTTPException(status_code=400, detail="File must be an image")
@@ -272,6 +314,7 @@ async def scan_check(file: UploadFile = File(...)):
 
 @app.post("/scan-check-debug")
 async def scan_check_debug(file: UploadFile = File(...)):
+    """Debug endpoint that returns raw OCR text"""
     try:
         image = await file.read()
         response = requests.post(
@@ -303,6 +346,7 @@ async def save_check(
     current_user = Depends(get_current_user),
     db = Depends(get_db)
 ):
+    """Save a scanned check to the database"""
     try:
         data = json.loads(check_data)
     except json.JSONDecodeError:
@@ -364,6 +408,7 @@ async def save_check(
 # ========== Management endpoints ==========
 @app.put("/api/checks/{check_id}")
 async def update_check(check_id: str, update_data: dict, db = Depends(get_db)):
+    """Update a check record"""
     check = CheckRecord.find_by_id(db, check_id)
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
@@ -379,6 +424,7 @@ async def update_check(check_id: str, update_data: dict, db = Depends(get_db)):
 
 @app.delete("/api/checks/{check_id}")
 async def delete_check(check_id: str, db = Depends(get_db)):
+    """Delete a check record"""
     check = CheckRecord.find_by_id(db, check_id)
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
@@ -393,6 +439,7 @@ async def mark_received(
     received_by: str = Form(...),
     db = Depends(get_db)
 ):
+    """Mark a check as received"""
     check = CheckRecord.find_by_id(db, check_id)
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
@@ -406,6 +453,7 @@ async def mark_received(
 
 @app.put("/api/checks/{check_id}/unreceived")
 async def mark_unreceived(check_id: str, db = Depends(get_db)):
+    """Mark a check as not received"""
     check = CheckRecord.find_by_id(db, check_id)
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
@@ -419,11 +467,13 @@ async def mark_unreceived(check_id: str, db = Depends(get_db)):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, db = Depends(get_db)):
+    """Dashboard HTML page"""
     checks = CheckRecord.get_all(db)
     return templates.TemplateResponse("dashboard.html", {"request": request, "checks": serialize_documents(checks)})
 
 @app.get("/")
 async def root():
+    """Root endpoint - API information"""
     return {
         "message": "Philippine Check Scanner API",
         "version": "2.0.0",
@@ -435,6 +485,7 @@ async def root():
 
 @app.get("/health")
 async def health_check(db = Depends(get_db)):
+    """Health check endpoint"""
     try:
         db.command('ping')
         return {"status": "healthy", "timestamp": datetime.now().isoformat(), "database": "connected"}
