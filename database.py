@@ -114,6 +114,7 @@ class CheckRecord:
             "date_deposited": check_data.get("date_deposited"),
             "bank_deposited": check_data.get("bank_deposited"),
             "deposited_by": check_data.get("deposited_by"),
+            "invoice_no": check_data.get("invoice_no"),  # ADDED: Invoice No. field
             "created_at": datetime.utcnow()
         }
         
