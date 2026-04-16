@@ -391,7 +391,7 @@ async def save_check(
         "date_deposited": data.get("date_deposited"),
         "bank_deposited": data.get("bank_deposited"),
         "deposited_by": data.get("deposited_by"),
-        "invoice_no": data.get("invoice_no")  # ADDED: Invoice No. field
+        "invoice_no": data.get("invoice_no")
     }
     
     saved_check = CheckRecord.create(db, check_record)
@@ -413,8 +413,8 @@ async def update_check(check_id: str, update_data: dict, db = Depends(get_db)):
     check = CheckRecord.find_by_id(db, check_id)
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
-    allowed_fields = ["account_name", "pay_to_the_order_of", "amount", "date", "cr", "cr_date", 
-                      "date_deposited", "bank_deposited", "received_by", "deposited_by", "invoice_no"]  # ADDED: invoice_no
+    allowed_fields = ["account_name", "account_no", "check_no", "pay_to_the_order_of", "amount", "date", "cr", "cr_date", 
+                      "date_deposited", "bank_deposited", "received_by", "deposited_by", "invoice_no"]
     filtered_update = {}
     for field in allowed_fields:
         if field in update_data:
@@ -481,7 +481,7 @@ async def root():
         "database": "MongoDB Atlas",
         "database_name": "Deltaplus_checkscanner",
         "status": "running",
-        "extracted_fields": ["account_no", "account_name", "pay_to_the_order_of", "check_no", "amount", "bank_name", "date", "invoice_no"]  # ADDED: invoice_no
+        "extracted_fields": ["account_no", "account_name", "pay_to_the_order_of", "check_no", "amount", "bank_name", "date", "invoice_no"]
     }
 
 @app.get("/health")
