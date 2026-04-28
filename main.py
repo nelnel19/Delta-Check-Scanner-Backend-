@@ -414,7 +414,7 @@ async def update_check(check_id: str, update_data: dict, db = Depends(get_db)):
     if not check:
         raise HTTPException(status_code=404, detail="Check not found")
     allowed_fields = ["account_name", "account_no", "check_no", "pay_to_the_order_of", "amount", "date", "cr", "cr_date", 
-                      "date_deposited", "bank_deposited", "received_by", "deposited_by", "invoice_no"]
+                      "date_deposited", "bank_deposited", "received_by", "deposited_by", "invoice_no", "bank_name"]  # Added bank_name
     filtered_update = {}
     for field in allowed_fields:
         if field in update_data:
